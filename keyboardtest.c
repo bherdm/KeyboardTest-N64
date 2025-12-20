@@ -119,15 +119,25 @@ int main(void)
 
     console_set_render_mode(RENDER_MANUAL);
 
-    uint64_t controller_identifiers = joybus_controller_identifiers();
-    uint16_t port1 = controller_identifiers >> 48;
-    uint16_t port2 = controller_identifiers >> 32;
-    uint16_t port3 = controller_identifiers >> 16;
-    uint16_t port4 = controller_identifiers >> 0;
+    uint16_t port1 = 0xFFFF;
+    uint16_t port2 = 0xFFFF;
+    uint16_t port3 = 0xFFFF;
+    uint16_t port4 = 0xFFFF;
+    uint32_t frame = 0;
 
     /* Main loop test */
     while(1) 
     {
+        if( (frame % 60) == 0 )
+        {
+            uint64_t controller_identifiers = joybus_controller_identifiers();
+            port1 = controller_identifiers >> 48;
+            port2 = controller_identifiers >> 32;
+            port3 = controller_identifiers >> 16;
+            port4 = controller_identifiers >> 0;
+        }
+        frame++;
+
         console_clear();
 
         printf("RandNET Keyboard Test ROM\n\n");
