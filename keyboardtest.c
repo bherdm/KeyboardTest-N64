@@ -8,6 +8,7 @@
 #include <malloc.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <time.h>
 #include <libdragon.h>
 
@@ -90,6 +91,20 @@ void dump_keyboard_presses( uint8_t port )
         port + 1, led_status[port], key1, key2, key3, out_status
     );
 
+    /* Mirror keyboard state to the SC64 USB debug lane, edge-triggered so the
+     * bounded SC64 `debug` capture neither floods at 60fps nor loses the signal. */
+    static uint16_t prev_k1[4], prev_k2[4], prev_k3[4];
+    static uint8_t  prev_st[4];
+    static bool     prev_seen[4];
+    if( !prev_seen[port] || key1 != prev_k1[port] || key2 != prev_k2[port] ||
+        key3 != prev_k3[port] || out_status != prev_st[port] )
+    {
+        debugf( "[kb] port%u LEDs=%02x keys=%04x %04x %04x status=%02x\n",
+                (unsigned)(port + 1), led_status[port], key1, key2, key3, out_status );
+        prev_k1[port] = key1; prev_k2[port] = key2; prev_k3[port] = key3;
+        prev_st[port] = out_status; prev_seen[port] = true;
+    }
+
     /* Turn on Caps Lock LED when Caps Lock key is pressed */
     if( key1 == 0x0F05 || key2 == 0x0F05 || key3 == 0x0F05 )
     {
@@ -115,6 +130,10 @@ int main(void)
     /* Initialize peripherals */
     display_init(RESOLUTION_320x240, DEPTH_32_BPP, 2, GAMMA_NONE, ANTIALIAS_RESAMPLE);
     console_init();
+    debug_init_usblog();    /* route debugf()/stderr to the SC64 USB debug lane (sc64deployer debug).
+                             * NOT debug_init_isviewer(): its one-shot boot probe fails on a real
+                             * SC64 because the deployer's --isv listener starts only AFTER the ROM
+                             * boots; the USB channel just needs the cart present. */
     controller_init();
 
     console_set_render_mode(RENDER_MANUAL);
@@ -135,6 +154,24 @@ int main(void)
             port2 = controller_identifiers >> 32;
             port3 = controller_identifiers >> 16;
             port4 = controller_identifiers >> 0;
+
+            /* ~1Hz heartbeat + identifier-change lines over the SC64 USB debug lane,
+             * so the host-side SC64 `debug` capture stays alive between keystrokes. */
+            static uint16_t prev_id[4];
+            static bool prev_id_seen;
+            const uint16_t cur_id[4] = { port1, port2, port3, port4 };
+            for( uint32_t p = 0; p < 4; p++ )
+            {
+                if( !prev_id_seen || cur_id[p] != prev_id[p] )
+                {
+                    debugf( "[id] port%u %s (0x%04X)\n", (unsigned)(p + 1),
+                            format_controller_identifier( cur_id[p] ), cur_id[p] );
+                }
+                prev_id[p] = cur_id[p];
+            }
+            prev_id_seen = true;
+            debugf( "[hb] frame=%lu P1=%04X P2=%04X P3=%04X P4=%04X\n",
+                    (unsigned long)frame, port1, port2, port3, port4 );
         }
         frame++;
 
