@@ -2,6 +2,7 @@ all: keyboardtest.z64
 .PHONY: all
 
 BUILD_DIR = build
+LIBDRAGON_PREVIEW = 2   # the Keyboard subsystem is a libdragon preview API
 include $(N64_INST)/include/n64.mk
 
 OBJS = $(BUILD_DIR)/keyboardtest.o

@@ -1,128 +1,63 @@
 /**
  * @file keyboardtest.c
  * @author Christopher Bonhage (me@christopherbonhage.com)
- * @brief N64 test ROM for RandNET Keyboard peripheral
+ * @brief N64 test ROM for keyboards: full-size keyboards through BlueRetroForever,
+ *        read by libdragon's Keyboard subsystem
  */
 
 #include <stdio.h>
-#include <malloc.h>
-#include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <time.h>
+#include <string.h>
 #include <libdragon.h>
 
-#define KEYBOARD_IDENTIFIER 0x0002
+/* How many of the latest key events the screen shows */
+#define EVENT_LOG_SIZE 8
 
 const char * format_controller_identifier( uint16_t identifier )
 {
     switch( identifier )
     {
-        case 0x0000: return "Unknown     ";
-        case 0x0500: return "Controller  ";
-        case 0x0001: return "VRU         ";
-        case 0x0200: return "Mouse       ";
-        case 0x0002: return "Keyboard    ";
-        case 0xFFFF: return "Disconnected";
-        default:     return "Unsupported ";
+        case JOYBUS_IDENTIFIER_NONE:                 return "None        ";
+        case JOYBUS_IDENTIFIER_N64_CONTROLLER:       return "Controller  ";
+        case JOYBUS_IDENTIFIER_N64_VOICE_RECOGNITION: return "VRU         ";
+        case JOYBUS_IDENTIFIER_N64_MOUSE:            return "Mouse       ";
+        case JOYBUS_IDENTIFIER_N64_RANDNET_KEYBOARD: return "Keyboard    ";
+        default:                                     return "Unsupported ";
     }
 }
 
-uint64_t joybus_controller_identifiers( void )
+/* The layout and arrangement BlueRetroForever is set to for a keyboard */
+static const char * format_layout( keyboard_layout_t layout )
 {
-    const uint64_t input[JOYBUS_BLOCK_DWORDS] =
-    {
-        0xff010300ffffffff,
-        0xff010300ffffffff,
-        0xff010300ffffffff,
-        0xff010300ffffffff,
-        0xfe00000000000000,
-        0,
-        0,
-        1
-    };
-    uint64_t output[JOYBUS_BLOCK_DWORDS];
-
-    joybus_exec( input, output );
-
-    uint32_t * out_words = (uint32_t *)output;
-
-    uint16_t port1 = out_words[1] >> 16;
-    uint16_t port2 = out_words[3] >> 16;
-    uint16_t port3 = out_words[5] >> 16;
-    uint16_t port4 = out_words[7] >> 16;
-
-    return (
-        ((uint64_t)port1 << 48) |
-        ((uint64_t)port2 << 32) |
-        ((uint64_t)port3 << 16) |
-        ((uint64_t)port4 << 0)
-    );
+    static const char * const names[] = { "US", "UK", "DE", "FR", "JP" };
+    if( layout == KEYBOARD_LAYOUT_NONE ) return "--";
+    return (unsigned)layout < sizeof(names) / sizeof(names[0]) ? names[layout] : "??";
 }
 
-void dump_keyboard_presses( uint8_t port )
+static const char * format_arrangement( keyboard_arrangement_t arrangement )
 {
-    assert( port < 4 );
-
-    /* Turn on the Power LED for all connected keyboards */
-    static uint8_t led_status[4] = { 0x04, 0x04, 0x04, 0x04 };
-
-    const uint64_t input[JOYBUS_BLOCK_DWORDS] = { 0, 0, 0, 0, 0, 0, 0, 1 };
-    uint64_t output[JOYBUS_BLOCK_DWORDS];
-
-    uint8_t * input_bytes = (uint8_t *)input;
-
-    input_bytes[port + 0] = 0x02; // Send bytes
-    input_bytes[port + 1] = 0x07; // Recv bytes
-    input_bytes[port + 2] = 0x13; // Command
-    input_bytes[port + 3] = led_status[port];
-
-    joybus_exec( input, output );
-
-    uint8_t * recv_bytes = ((uint8_t *)output) + port + 4;
-
-    uint16_t key1 = ((uint16_t)recv_bytes[0] << 8) | recv_bytes[1];
-    uint16_t key2 = ((uint16_t)recv_bytes[2] << 8) | recv_bytes[3];
-    uint16_t key3 = ((uint16_t)recv_bytes[4] << 8) | recv_bytes[5];
-    uint8_t out_status = recv_bytes[6];
-    
-    printf(
-        "Port %d        %02x    %04x   %04x   %04x     %02x\n",
-        port + 1, led_status[port], key1, key2, key3, out_status
-    );
-
-    /* Mirror keyboard state to the SC64 USB debug lane, edge-triggered so the
-     * bounded SC64 `debug` capture neither floods at 60fps nor loses the signal. */
-    static uint16_t prev_k1[4], prev_k2[4], prev_k3[4];
-    static uint8_t  prev_st[4];
-    static bool     prev_seen[4];
-    if( !prev_seen[port] || key1 != prev_k1[port] || key2 != prev_k2[port] ||
-        key3 != prev_k3[port] || out_status != prev_st[port] )
+    switch( arrangement )
     {
-        debugf( "[kb] port%u LEDs=%02x keys=%04x %04x %04x status=%02x\n",
-                (unsigned)(port + 1), led_status[port], key1, key2, key3, out_status );
-        prev_k1[port] = key1; prev_k2[port] = key2; prev_k3[port] = key3;
-        prev_st[port] = out_status; prev_seen[port] = true;
+        case KEYBOARD_ARRANGEMENT_MAC: return "Mac";
+        case KEYBOARD_ARRANGEMENT_PC:  return "PC";
+        default:                       return "--";
     }
+}
 
-    /* Turn on Caps Lock LED when Caps Lock key is pressed */
-    if( key1 == 0x0F05 || key2 == 0x0F05 || key3 == 0x0F05 )
+/* BlueRetroForever's state, read through its command 0x7B on the first port
+ * with a device that answers it; nothing is changed. Returns the port, or -1. */
+static int brf_read( const uint16_t identifiers[JOYPAD_PORT_COUNT], brf_status_t * status,
+                           brf_keyboard_settings_t settings[JOYPAD_PORT_COUNT], brf_result_t * kb_result )
+{
+    JOYPAD_PORT_FOREACH( port )
     {
-        led_status[port] |= 0x02;
+        if( identifiers[port] == JOYBUS_IDENTIFIER_NONE ) continue;
+        if( brf_get_status( port, status ) != BRF_OK ) continue;
+        *kb_result = brf_get_keyboard_settings( port, settings );
+        return port;
     }
-    else
-    {
-        led_status[port] &= ~0x02;
-    }
-    /* Turn on Num Lock LED when Num Lock key is pressed */
-    if( key1 == 0x0A05 || key2 == 0x0A05 || key3 == 0x0A05 )
-    {
-        led_status[port] |= 0x01;
-    }
-    else
-    {
-        led_status[port] &= ~0x01;
-    }
+    return -1;
 }
 
 int main(void)
@@ -134,64 +69,161 @@ int main(void)
                              * NOT debug_init_isviewer(): its one-shot boot probe fails on a real
                              * SC64 because the deployer's --isv listener starts only AFTER the ROM
                              * boots; the USB channel just needs the cart present. */
-    controller_init();
+    keyboard_init();        /* starts libdragon's Joybus device detection too, which the [id] lines read */
 
     console_set_render_mode(RENDER_MANUAL);
 
-    uint16_t port1 = 0xFFFF;
-    uint16_t port2 = 0xFFFF;
-    uint16_t port3 = 0xFFFF;
-    uint16_t port4 = 0xFFFF;
+    uint16_t identifiers[JOYPAD_PORT_COUNT];
+    uint16_t prev_id[JOYPAD_PORT_COUNT];
+    bool prev_id_seen = false;
+    brf_status_t br_status = {0};
+    brf_keyboard_settings_t br_settings[JOYPAD_PORT_COUNT] = {0};
+    brf_result_t br_kb_result = BRF_NOT_PRESENT;
+    int br_port = -1;
+    keyboard_event_t event_log[EVENT_LOG_SIZE];
+    int event_count = 0;
     uint32_t frame = 0;
 
     /* Main loop test */
-    while(1) 
+    while(1)
     {
+        /* Each port's device, from libdragon's background detection (once a second).
+         * Identifier changes go to the SC64 USB debug lane as they happen. */
+        JOYPAD_PORT_FOREACH( port )
+        {
+            identifiers[port] = joybus_get_identifier( port, NULL );
+            if( !prev_id_seen || identifiers[port] != prev_id[port] )
+            {
+                debugf( "[id] port%u %s (0x%04X)\n", (unsigned)(port + 1),
+                        format_controller_identifier( identifiers[port] ), identifiers[port] );
+            }
+            prev_id[port] = identifiers[port];
+        }
+        prev_id_seen = true;
+
+        /* ~1Hz heartbeat, so the host-side SC64 `debug` capture stays alive between keystrokes. */
         if( (frame % 60) == 0 )
         {
-            uint64_t controller_identifiers = joybus_controller_identifiers();
-            port1 = controller_identifiers >> 48;
-            port2 = controller_identifiers >> 32;
-            port3 = controller_identifiers >> 16;
-            port4 = controller_identifiers >> 0;
+            debugf( "[hb] frame=%lu P1=%04X P2=%04X P3=%04X P4=%04X\n", (unsigned long)frame,
+                    identifiers[0], identifiers[1], identifiers[2], identifiers[3] );
 
-            /* ~1Hz heartbeat + identifier-change lines over the SC64 USB debug lane,
-             * so the host-side SC64 `debug` capture stays alive between keystrokes. */
-            static uint16_t prev_id[4];
-            static bool prev_id_seen;
-            const uint16_t cur_id[4] = { port1, port2, port3, port4 };
-            for( uint32_t p = 0; p < 4; p++ )
+            /* BlueRetroForever's state once a second, logged when it changes */
+            brf_status_t status = {0};
+            brf_keyboard_settings_t settings[JOYPAD_PORT_COUNT] = {0};
+            brf_result_t kb_result = BRF_NOT_PRESENT;
+            int port = brf_read( identifiers, &status, settings, &kb_result );
+            if( port != br_port || memcmp( &status, &br_status, sizeof(status) ) != 0 ||
+                kb_result != br_kb_result || memcmp( settings, br_settings, sizeof(settings) ) != 0 )
             {
-                if( !prev_id_seen || cur_id[p] != prev_id[p] )
+                if( port < 0 ) debugf( "[br] none\n" );
+                else
                 {
-                    debugf( "[id] port%u %s (0x%04X)\n", (unsigned)(p + 1),
-                            format_controller_identifier( cur_id[p] ), cur_id[p] );
+                    debugf( "[br] via port%d v%u pairing=%d led=%u devices=%d %d %d %d\n", port + 1,
+                            status.version, status.pairing, status.led_level,
+                            status.device[0], status.device[1], status.device[2], status.device[3] );
+                    if( kb_result != BRF_OK ) debugf( "[br] keyboard settings: result %d\n", kb_result );
+                    else JOYPAD_PORT_FOREACH( p )
+                        debugf( "[br] port%u %s %s %s%s\n", (unsigned)(p + 1), settings[p].classic ? "classic" : "full",
+                                format_layout( settings[p].layout ), format_arrangement( settings[p].arrangement ),
+                                settings[p].temporary ? " until-power-off" : "" );
                 }
-                prev_id[p] = cur_id[p];
+                br_port = port; br_status = status; br_kb_result = kb_result;
+                memcpy( br_settings, settings, sizeof(settings) );
             }
-            prev_id_seen = true;
-            debugf( "[hb] frame=%lu P1=%04X P2=%04X P3=%04X P4=%04X\n",
-                    (unsigned long)frame, port1, port2, port3, port4 );
         }
         frame++;
 
+        /* Every key that went down or up since the last frame, in order. Caps Lock
+         * and Num Lock toggle their LEDs: what a key does is the program's to decide. */
+        keyboard_event_t event;
+        while( keyboard_get_event( &event ) )
+        {
+            const char * name = keyboard_key_name( event.key );
+            debugf( "[ev] port%u %s %04x %s t=%lu\n", (unsigned)(event.port + 1),
+                    event.pressed ? "down" : "up", event.key, name ? name : "?",
+                    (unsigned long)get_ticks_ms() );
+
+            if( event.pressed && event.key == KEYBOARD_KEY_CAPSLOCK )
+                keyboard_set_leds( event.port, keyboard_get_leds( event.port ) ^ KEYBOARD_LED_CAPS_LOCK );
+            if( event.pressed && event.key == KEYBOARD_KEY_NUMLOCKCLEAR )
+                keyboard_set_leds( event.port, keyboard_get_leds( event.port ) ^ KEYBOARD_LED_NUM_LOCK );
+            if( event.pressed && event.key == KEYBOARD_KEY_SCROLLLOCK )
+                keyboard_set_leds( event.port, keyboard_get_leds( event.port ) ^ KEYBOARD_LED_SCROLL_LOCK );
+
+            if( event_count == EVENT_LOG_SIZE )
+            {
+                for( int i = 1; i < EVENT_LOG_SIZE; i++ ) event_log[i - 1] = event_log[i];
+                event_count--;
+            }
+            event_log[event_count++] = event;
+        }
+
         console_clear();
 
-        printf("RandNET Keyboard Test ROM\n\n");
+        printf("Keyboard Test ROM\n\n");
 
-        printf("Controller Port 1: %s (0x%04X)\n", format_controller_identifier(port1), port1);
-        printf("Controller Port 2: %s (0x%04X)\n", format_controller_identifier(port2), port2);
-        printf("Controller Port 3: %s (0x%04X)\n", format_controller_identifier(port3), port3);
-        printf("Controller Port 4: %s (0x%04X)\n", format_controller_identifier(port4), port4);
+        JOYPAD_PORT_FOREACH( port )
+        {
+            printf("Controller Port %d: %s (0x%04X)\n", port + 1,
+                   format_controller_identifier( identifiers[port] ), identifiers[port]);
+        }
+
+        if( br_port < 0 ) printf("\nBlueRetroForever: none\n");
+        else printf("\nBlueRetroForever v%u: pairing %s, LED %u\n", br_status.version,
+                    br_status.pairing ? "open" : "closed", br_status.led_level);
 
         printf("\n");
-        printf("Keyboard:    LEDs   Key1   Key2   Key3   Status\n");
-        printf("---------- | ---- | ---- | ---- | ---- | ------\n");
+        printf("Keyboard  LEDs  Layout  Held\n");
 
-        if( port1 == KEYBOARD_IDENTIFIER ) dump_keyboard_presses( 0 );
-        if( port2 == KEYBOARD_IDENTIFIER ) dump_keyboard_presses( 1 );
-        if( port3 == KEYBOARD_IDENTIFIER ) dump_keyboard_presses( 2 );
-        if( port4 == KEYBOARD_IDENTIFIER ) dump_keyboard_presses( 3 );
+        JOYPAD_PORT_FOREACH( port )
+        {
+            if( !keyboard_is_connected( port ) ) continue;
+
+            keyboard_keys_t keys = keyboard_get_keys( port );
+            uint8_t leds = keyboard_get_leds( port );
+            keyboard_layout_t layout = keyboard_get_layout( port );
+            keyboard_arrangement_t arrangement = keyboard_get_arrangement( port );
+            int held = 0;
+            while( held < KEYBOARD_KEYS_MAX && keys.key[held] ) held++;
+
+            printf( "Port %d     %02x   %s %-3s  %2d%s\n", port + 1, leds, format_layout( layout ),
+                    format_arrangement( arrangement ), held, keys.overflow ? "+" : "" );
+            printf( " " );
+            for( int i = 0; i < held; i++ )
+            {
+                const char * name = keyboard_key_name( keys.key[i] );
+                printf( " %s", name ? name : "?" );
+            }
+            printf( "\n" );
+
+            /* Mirror keyboard state to the SC64 USB debug lane, edge-triggered so the
+             * bounded SC64 `debug` capture neither floods at 60fps nor loses the signal. */
+            static keyboard_keys_t prev_keys[4];
+            static uint8_t prev_leds[4];
+            static keyboard_layout_t prev_layout[4];
+            static keyboard_arrangement_t prev_arrangement[4];
+            static bool prev_seen[4];
+            if( !prev_seen[port] || memcmp( &keys, &prev_keys[port], sizeof(keys) ) != 0 ||
+                leds != prev_leds[port] || layout != prev_layout[port] || arrangement != prev_arrangement[port] )
+            {
+                char list[KEYBOARD_KEYS_MAX * 5 + 1] = "";
+                for( int i = 0; i < held; i++ ) sprintf( &list[i * 5], " %04x", keys.key[i] );
+                debugf( "[kb] port%u LEDs=%02x layout=%s arrangement=%s held=%d overflow=%d keys=%s\n",
+                        (unsigned)(port + 1), leds, format_layout( layout ), format_arrangement( arrangement ),
+                        held, keys.overflow, held ? &list[1] : "-" );
+                prev_keys[port] = keys; prev_leds[port] = leds; prev_layout[port] = layout;
+                prev_arrangement[port] = arrangement; prev_seen[port] = true;
+            }
+        }
+
+        printf("\n");
+        printf("Latest keys:\n");
+        for( int i = 0; i < event_count; i++ )
+        {
+            const char * name = keyboard_key_name( event_log[i].key );
+            printf("  Port %d  %-4s  %04x  %s\n", event_log[i].port + 1,
+                   event_log[i].pressed ? "down" : "up", event_log[i].key, name ? name : "?");
+        }
 
         console_render();
     }
